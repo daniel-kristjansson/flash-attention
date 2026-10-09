@@ -482,6 +482,9 @@ def _flash_attn_fwd(
     if arch // 10 in [8, 12]:
         num_threads = 128
 
+    # SM120 D=256 decode: 64x16 tile fits two CTAs per SM (ping-pong);
+    # must stay at 1 KV stage (2 stages = 64 KB would evict the second CTA).
+    pingpong_decode = False
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
     if tile_mn is None:
         if arch // 10 == 12:
@@ -498,8 +501,24 @@ def _flash_attn_fwd(
                 fwd_cfg = FwdConfig(128, 128, True, True)
             elif head_dim <= 192:
                 fwd_cfg = FwdConfig(128, 64, True, True)
-            else:  # head_dim 256: sQ+sK+sV must fit 99 KB SMEM -> 64x64
-                fwd_cfg = FwdConfig(64, 64, True, True)
+            else:  # head_dim 256: sQ+sK+sV must fit 99 KB SMEM
+                # 64x64 (32 + 32 + 32 = 96 KB) fits 1 KV stage; 2 stages need 160 KB.
+                # For underfilled pure-decode grids, 64x16 (48 KB) fits two CTAs per
+                # SM: the second CTA's MMA hides the first CTA's cp.async latency
+                # (CTA-level ping-pong, 16.7% occupancy vs 8.3%).
+                env_tile_n = os.environ.get("FA4_SM120_TILE_N_256")
+                if env_tile_n is not None:
+                    tile_n_256 = int(env_tile_n)
+                    pingpong_decode = False
+                else:
+                    decode_like = (
+                        max_seqlen_q is not None
+                        and max_seqlen_q <= 1
+                        and total_q * num_head < 188  # grid cannot fill the SMs
+                    )
+                    pingpong_decode = decode_like
+                    tile_n_256 = 16 if decode_like else 64
+                fwd_cfg = FwdConfig(64, tile_n_256, True, True)
         elif arch // 10 == 8:
             fwd_cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:
@@ -929,7 +948,10 @@ def _flash_attn_fwd(
                     # allows: sQ + num_stages*(sK+sV) must fit SM120's 99 KB.
                     # E.g. tile 128x64 D=128 fits 2 stages (96KB); tile 64x64
                     # D=256 only fits 1 stage (96KB) and needs 160KB for 2.
-                    num_stages_sm120 = (
+                    force_stages = int(os.environ.get("FA4_SM120_FORCE_STAGES", "0"))
+                    if pingpong_decode:
+                        force_stages = force_stages or 1
+                    num_stages_sm120 = force_stages if force_stages else (
                         2
                         if FlashAttentionForwardSm120.can_implement(
                             dtype, head_dim, head_dim_v, tile_m, tile_n,
