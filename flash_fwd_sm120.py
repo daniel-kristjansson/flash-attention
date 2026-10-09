@@ -19,16 +19,15 @@ class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
         # BaseDSL._get_dsl().get_arch_enum() returns the real GPU arch (sm_121a on DGX Spark),
         # but SM120 must use the SM80 epilogue path (no TMA-O support in this kernel variant).
         self.arch = Arch.sm_80
-        # PackGQA on the Sm80 code path is broken for GQA/MQA shapes: cute.domain_offset
-        # at flash_fwd.py:427 and the pack_gqa pointer-resolution path at pack_gqa.py:139
-        # raise crd2idx errors against the packed ((qhead_per_kvhead, seqlen_q), headdim)
-        # layout. Sm90.__call__ and Sm100.__call__ apply pack_gqa_layout before handing
-        # tensors to PackGQA; Sm80.__call__ does not. Even adding those transforms is not
-        # sufficient because the Sm80 mainloop's tile sizing assumes tile_m divides the
-        # seqlen dimension cleanly, which fails when qhead_per_kvhead does not divide
-        # tile_m. Disabling pack_gqa on Sm120 routes GQA through the non-packed path,
-        # which is functionally correct on every GQA/MQA shape we tested. Tracked upstream
-        # as Dao-AILab/flash-attention#2484.
+        # PackGQA is disabled on this path (Dao-AILab/flash-attention#2484).
+        # Verified 2026-07-11 by re-adding the pack_gqa_layout transforms from
+        # Sm90.__call__: the mainloop's cute.local_tile(mQ, ...) requires the
+        # packed row mode to divide cleanly by tile_m, i.e. qhead_per_kvhead | tile_m.
+        # Qwen3.8 has G=24/4=6, and the only warp-mma-valid tile_m values (multiples
+        # of 64 with (tile_m*2) % 128 == 0) that are also multiples of 6 start at
+        # lcm(6, 64) = 192 rows -- sQ alone is 96 KB at D=256, over budget. G=6
+        # pack_gqa is structurally inexpressible in this kernel family; G=8 models
+        # could use it (the Sm90/Sm100 transforms port cleanly into this __call__).
         self.pack_gqa = False
 
     @staticmethod
