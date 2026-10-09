@@ -541,9 +541,8 @@ def _flash_attn_fwd(
     if num_splits < 1:
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
 
-    # SM120 does not support SplitKV in this kernel variant
-    if arch // 10 == 12 and num_splits > 1:
-        num_splits = 1
+    # SM120 (arch 12) takes the SM80 kernel path, which supports split-KV
+    # (f32 partials written straight from the MMA accumulators, no sO in SMEM).
 
     # SplitKV uses float32 partial output, which doubles the O buffer size
     # in shared memory, causing OOM for diff-headdim (192, 128)
