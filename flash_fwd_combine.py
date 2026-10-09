@@ -318,6 +318,9 @@ class FlashAttentionForwardCombine:
             block=[self.num_threads, 1, 1],
             smem=smem_size,
             stream=stream,
+            # PDL: kernel body already calls griddepcontrol.wait before reading
+            # the fwd partials; the attribute lets it dispatch during fwd's drain.
+            use_pdl=True,
         )
 
     @cute.kernel
