@@ -985,6 +985,14 @@ def _flash_attn_fwd(
                 f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
             )
         # TODO: check @can_implement
+        # SM80/SM120 host signatures annotate the window args as Optional[Int32]
+        # (SM90/SM100 convert internally); convert Python ints here for those.
+        window_size_left_c = (
+            Int32(window_size_left) if window_size_left is not None else None
+        )
+        window_size_right_c = (
+            Int32(window_size_right) if window_size_right is not None else None
+        )
         if qv is not None:
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 fa_fwd,
@@ -1001,8 +1009,8 @@ def _flash_attn_fwd(
                 seqused_k_tensor,
                 gather_kv_indices_tensor,
                 page_table_tensor,
-                window_size_left,
-                window_size_right,
+                window_size_left_c,
+                window_size_right_c,
                 current_stream,
                 options="--enable-tvm-ffi",
             )
@@ -1020,8 +1028,8 @@ def _flash_attn_fwd(
                 seqused_q_tensor,
                 seqused_k_tensor,
                 page_table_tensor,
-                window_size_left,
-                window_size_right,
+                window_size_left_c,
+                window_size_right_c,
                 learnable_sink_tensor,
                 sparse_tensors,
                 cute_aux_tensors,
