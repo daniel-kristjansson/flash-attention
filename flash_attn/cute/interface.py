@@ -43,6 +43,7 @@ from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
+from flash_attn.cute.flash_fwd_sm120_tma import FlashAttentionForwardSm120Tma
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
@@ -930,9 +931,12 @@ def _flash_attn_fwd(
     requested_disable_2cta = utils._get_disable_2cta_default(is_fwd=True)
     requested_disable_s_ping_pong = utils._get_disable_s_ping_pong_default()
 
-    # SM80/SM120: uses SM80 MMA, 128 threads (4 warps)
-    if arch // 10 in [8, 12]:
+    # SM80/SM120: uses SM80 MMA. SM120 uses 8 MMA warps to halve acc reg/thread
+    # (acc_S 64+acc_O 128 -> 32+64) and eliminate ~17 MB of local spilling.
+    if arch // 10 == 8:
         num_threads = 128
+    elif arch // 10 == 12:
+        num_threads = 256
 
     # Preserve the caller's hint.
     host_max_seqlen_q = max_seqlen_q if not torch.is_tensor(max_seqlen_q) else None
@@ -1753,36 +1757,58 @@ def _flash_attn_fwd(
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
-            if page_table is not None:
-                assert seqused_k is not None, (
-                    "Paged KV on SM120 requires seqused_k (actual sequence lengths per batch)"
+            # TMA kernel when: no paged KV, no varlen, no split-KV.
+            # The TMA kernel does not implement split-KV (its O store uses a fixed 4D
+            # layout), so split-KV requests fall through to the SM80-base SM120 kernel,
+            # which handles split-KV (FP32 partials) and paged KV.
+            is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None
+            use_tma_sm120 = (page_table is None and not is_varlen and not is_split_kv)
+            if use_tma_sm120 and FlashAttentionForwardSm120Tma.can_implement(
+                dtype, head_dim, head_dim_v, tile_m, tile_n,
+                num_mma_warps=8, kv_stages=2, is_causal=causal,
+            ):
+                fa_fwd = FlashAttentionForwardSm120Tma(
+                    dtype,
+                    head_dim,
+                    head_dim_v,
+                    qhead_per_kvhead,
+                    is_causal=causal,
+                    is_local=local,
+                    pack_gqa=pack_gqa,
+                    tile_m=tile_m,
+                    tile_n=tile_n,
+                    num_mma_warps=8,
+                    kv_stages=2,
+                    score_mod=score_mod,
+                    mask_mod=mask_mod,
+                    has_aux_tensors=aux_tensors is not None,
                 )
-                # Note: tile_n=64 with num_threads=128 works for paged KV — threads 64-127
-                # get is_valid=False in the page table loop and are skipped. This is slightly
-                # less efficient than tile_n=128 but enables num_stages=2 pipelining (see below).
-            fa_fwd = FlashAttentionForwardSm120(
-                dtype,
-                head_dim,
-                head_dim_v,
-                qhead_per_kvhead,
-                is_causal=causal,
-                is_local=local,
-                is_split_kv=is_split_kv,
-                pack_gqa=pack_gqa,
-                tile_m=tile_m,
-                tile_n=tile_n,
+            else:
+                if page_table is not None:
+                    assert seqused_k is not None, (
+                        "Paged KV on SM120 requires seqused_k (actual sequence lengths per batch)"
+                    )
                 # num_stages=2: pipeline K/V loads with MMA — for paged KV this also overlaps
                 # page table lookups with MMA, which hides the scatter-gather latency.
-                # SMEM budget at num_stages=2: max config is D=128, tile_n=64 (FwdConfig default):
-                #   sQ=32KB + sK=32KB + sV=32KB = 96KB ≤ 99KB SM120 capacity ✓
-                # tile_n=128 (D<=64 path) gives 16+32+32=80KB ✓
-                num_stages=2,
-                num_threads=num_threads,
-                Q_in_regs=False,
-                score_mod=score_mod,
-                mask_mod=mask_mod,
-                has_aux_tensors=aux_tensors is not None,
-            )
+                # SMEM budget at num_stages=2: D=128, tile_n=64 -> 96KB; D<=64, tile_n=128 -> 80KB.
+                fa_fwd = FlashAttentionForwardSm120(
+                    dtype,
+                    head_dim,
+                    head_dim_v,
+                    qhead_per_kvhead,
+                    is_causal=causal,
+                    is_local=local,
+                    is_split_kv=is_split_kv,
+                    pack_gqa=pack_gqa,
+                    tile_m=tile_m,
+                    tile_n=tile_n,
+                    num_stages=2,
+                    num_threads=num_threads,
+                    Q_in_regs=False,
+                    score_mod=score_mod,
+                    mask_mod=mask_mod,
+                    has_aux_tensors=aux_tensors is not None,
+                )
         else:
             raise ValueError(
                 f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
