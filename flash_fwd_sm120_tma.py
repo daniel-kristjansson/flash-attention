@@ -153,6 +153,10 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         # epilogue branch which works correctly on every GQA/MQA shape we tested.
         # Tracked upstream as Dao-AILab/flash-attention#2484.
         self.pack_gqa = False
+        # The inherited epilogue (flash_fwd.py) reads self.use_pdl; the TMA
+        # launch does not wire PDL (no split-KV combine boundary), so keep it
+        # off here rather than inheriting the non-TMA kernel's env default.
+        self.use_pdl = False
 
     @staticmethod
     def can_implement(
