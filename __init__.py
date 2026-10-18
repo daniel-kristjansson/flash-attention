@@ -6,7 +6,7 @@ RTX PRO 6000, DGX Spark, RTX 5090):
 
 - #2336 — SM120 split-KV (FlashDecoding) with FP32 partial outputs
 - #2348 — SM120 kernel-level paged KV cache support (includes #2336)
-- #2349 — SM120 TMA forward kernel with warp specialization
+- #2599 — SM120 TMA forward kernel, 8 MMA warps (supersedes #2349's 4-warp version)
 - #2389 — SM80/SM120 block-sparse forward attention support
 - #2439 — FA4 dropout (Philox-based, per-element, all arches)
 
