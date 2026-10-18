@@ -715,6 +715,9 @@ def _flash_attn_fwd(
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
+    dropout_p: float = 0.0,
+    dropout_seed: Optional[int] = None,
+    dropout_offset: int = 0,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
 ]:
@@ -1523,6 +1526,7 @@ def _flash_attn_fwd(
         gather_kv_length,
         sparse_kv,
         disable_sparse_kv_bitmask,
+        dropout_p > 0.0,
         fa_logging.get_fa_log_level(),
     )
 
@@ -1757,15 +1761,16 @@ def _flash_attn_fwd(
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity.
             # The non-TMA SM80-base SM120 kernel handles split-KV (FP32 partials), paged KV,
-            # and block-sparse; the TMA kernel handles only dense, non-paged, non-varlen,
-            # non-split-KV, non-block-sparse (it has a fixed 4D O store and no block-sparse
-            # mainloop), so those cases fall through to the non-TMA kernel.
+            # block-sparse, and dropout; the TMA kernel handles only dense, non-paged,
+            # non-varlen, non-split-KV, non-block-sparse, no-dropout (fixed 4D O store, no
+            # block-sparse mainloop, no dropout), so those cases fall through to non-TMA.
             is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None
             use_tma_sm120 = (
                 page_table is None
                 and not is_varlen
                 and not is_split_kv
                 and not use_block_sparsity
+                and dropout_p == 0.0
             )
             if use_tma_sm120 and FlashAttentionForwardSm120Tma.can_implement(
                 dtype, head_dim, head_dim_v, tile_m, tile_n,
@@ -1812,6 +1817,7 @@ def _flash_attn_fwd(
                     score_mod=score_mod,
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,
+                    dropout_p=dropout_p,
                 )
         else:
             raise ValueError(
@@ -1884,6 +1890,17 @@ def _flash_attn_fwd(
                     cu_total_m_blocks_tensor,
                     cu_total_splits_m_blocks_tensor,
                 ])
+            # SM120 forward __call__ takes (dropout_seed, dropout_offset) before stream.
+            if arch // 10 == 12:
+                if dropout_p > 0.0:
+                    _seed = dropout_seed if dropout_seed is not None else int(
+                        torch.randint(0, 2**62, (1,), dtype=torch.int64).item()
+                    )
+                    compile_args.append(cutlass.Int64(_seed))
+                    compile_args.append(cutlass.Int64(dropout_offset))
+                else:
+                    compile_args.append(cutlass.Int64(0))
+                    compile_args.append(cutlass.Int64(0))
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
 
@@ -1976,6 +1993,16 @@ def _flash_attn_fwd(
                     cu_total_m_blocks,
                     cu_total_splits_m_blocks,
                 ])
+            if arch // 10 == 12:
+                if dropout_p > 0.0:
+                    _seed_rt = dropout_seed if dropout_seed is not None else int(
+                        torch.randint(0, 2**62, (1,), dtype=torch.int64).item()
+                    )
+                    call_args.append(cutlass.Int64(_seed_rt))
+                    call_args.append(cutlass.Int64(dropout_offset))
+                else:
+                    call_args.append(cutlass.Int64(0))
+                    call_args.append(cutlass.Int64(0))
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         # Combine writes a seqlen-contiguous LSE. The MLA LSE is (..., s, h) contiguous, so
@@ -2324,6 +2351,9 @@ def _flash_attn_bwd(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
     learnable_sink: Optional[torch.Tensor] = None,
+    dropout_p: float = 0.0,
+    dropout_seed: Optional[int] = None,
+    dropout_offset: int = 0,
 ) -> Tuple[torch.Tensor, ...]:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     fake_mode = is_fake_mode()
@@ -2389,6 +2419,7 @@ def _flash_attn_bwd(
         use_2cta_instrs = False
         dQaccum_order = dKVaccum_order = None
         num_threads = 128
+        dQ_single_wg = False  # SM120 single-warpgroup dQ; was undefined in the compile key.
         assert not (block_sparse_tensors is not None), "Block sparsity backward not supported on SM 12.0"
         assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 12.0"
         assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
@@ -2872,6 +2903,7 @@ def _flash_attn_bwd(
             single_q_block,
             single_k_block,
             cu_total_m_blocks_k is not None,
+            dropout_p > 0.0,
         )
     else:
         compile_key = (
@@ -2966,6 +2998,7 @@ def _flash_attn_bwd(
                 V_in_regs=V_in_regs,
                 score_mod=score_mod,
                 score_mod_bwd=score_mod_bwd,
+                dropout_p=dropout_p,
             )
         elif arch // 10 == 9:
             fa_bwd_obj = FlashAttentionBackwardSm90(
@@ -3090,6 +3123,15 @@ def _flash_attn_bwd(
                     else None,
                 )
             )
+        # SM120 backward __call__ takes (dropout_seed, dropout_offset) before stream.
+        if arch // 10 == 12:
+            if dropout_p > 0.0:
+                _bseed = dropout_seed if dropout_seed is not None else 0
+                compile_args.append(cutlass.Int64(_bseed))
+                compile_args.append(cutlass.Int64(dropout_offset))
+            else:
+                compile_args.append(cutlass.Int64(0))
+                compile_args.append(cutlass.Int64(0))
         compile_args.append(current_stream)
 
         # TODO: check @can_implement
@@ -3145,6 +3187,15 @@ def _flash_attn_bwd(
                     else None,
                 )
             )
+        # SM120 backward __call__ takes (dropout_seed, dropout_offset) before stream.
+        if arch // 10 == 12:
+            if dropout_p > 0.0:
+                _bseed_rt = dropout_seed if dropout_seed is not None else 0
+                call_args.append(cutlass.Int64(_bseed_rt))
+                call_args.append(cutlass.Int64(dropout_offset))
+            else:
+                call_args.append(cutlass.Int64(0))
+                call_args.append(cutlass.Int64(0))
         _flash_attn_bwd.compile_cache[compile_key](*call_args)
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
     # hd=256 2CTA backward has its own internal postprocess, skip here.
@@ -3847,6 +3898,7 @@ class FlashAttnFunc(torch.autograd.Function):
         return_lse: bool = False,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
+        dropout_p: float = 0.0,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3856,6 +3908,11 @@ class FlashAttnFunc(torch.autograd.Function):
             # by setting q, k to None
             qv = q if qv is None else qv
             q = k = None
+        # One RNG seed generated in the forward and reused in the backward so both
+        # regenerate the IDENTICAL dropout keep-mask.
+        dropout_seed = None
+        if dropout_p > 0.0:
+            dropout_seed = int(torch.randint(0, 2**62, (1,), dtype=torch.int64).item())
         out, lse, p, row_max, o_lo = _flash_attn_fwd(
             q,
             k,
@@ -3877,6 +3934,9 @@ class FlashAttnFunc(torch.autograd.Function):
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
+            dropout_p=dropout_p,
+            dropout_seed=dropout_seed,
+            dropout_offset=0,
         )
         ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
@@ -3893,6 +3953,8 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.aux_scalars = aux_scalars
         ctx.block_sparse_tensors_bwd = block_sparse_tensors_bwd
         ctx.gather_bwd_token_chunk = gather_bwd_token_chunk
+        ctx.dropout_p = dropout_p
+        ctx.dropout_seed = dropout_seed
         ctx.set_materialize_grads(False)
         return out, lse
 
@@ -3949,6 +4011,9 @@ class FlashAttnFunc(torch.autograd.Function):
                 block_sparse_tensors=ctx.block_sparse_tensors_bwd,
                 dlse=dlse,
                 learnable_sink=learnable_sink,
+                dropout_p=ctx.dropout_p,
+                dropout_seed=ctx.dropout_seed,
+                dropout_offset=0,
             )
             if learnable_sink is None:
                 dq, dk, dv = bwd_result
@@ -4209,6 +4274,7 @@ def flash_attn_func(
     return_lse: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    dropout_p: float = 0.0,
 ):
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
@@ -4251,6 +4317,7 @@ def flash_attn_func(
         return_lse,
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
+        dropout_p,
     )
 
 
