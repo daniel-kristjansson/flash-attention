@@ -17,6 +17,16 @@ class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
         """Force SM80 code paths while the DSL still targets the resident SM120 GPU."""
         super().__init__(*args, **kwargs)
         self.arch = Arch.sm_80
+        # PackGQA is disabled on this path (Dao-AILab/flash-attention#2484).
+        # Verified 2026-07-11 by re-adding the pack_gqa_layout transforms from
+        # Sm90.__call__: the mainloop's cute.local_tile(mQ, ...) requires the
+        # packed row mode to divide cleanly by tile_m, i.e. qhead_per_kvhead | tile_m.
+        # Qwen3.8 has G=24/4=6, and the only warp-mma-valid tile_m values (multiples
+        # of 64 with (tile_m*2) % 128 == 0) that are also multiples of 6 start at
+        # lcm(6, 64) = 192 rows -- sQ alone is 96 KB at D=256, over budget. G=6
+        # pack_gqa is structurally inexpressible in this kernel family; G=8 models
+        # could use it (the Sm90/Sm100 transforms port cleanly into this __call__).
+        self.pack_gqa = False
 
     @staticmethod
     def can_implement(
