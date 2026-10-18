@@ -348,6 +348,7 @@ def _get_fwd_config(
     device,
     seqlen_q: Optional[int] = None,
     tile_mn: Optional[Tuple[int, int]] = None,
+    tile_n_256: Optional[int] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     mma_pv_is_rs: Optional[bool] = None,
     intra_wg_overlap: Optional[bool] = None,
@@ -360,10 +361,16 @@ def _get_fwd_config(
     if tile_mn is None:
         if arch // 10 == 12:
             # SM120 tile sizes tuned for 99 KB SMEM capacity:
-            # D<=64:  128x128 → 48 KB (good occupancy)
-            # D>64:   128x64  → 64 KB (128x128 would use 96 KB, hurting occupancy)
-            if head_dim > 64:
+            # D<=64:  128x128 -> 48 KB (good occupancy)
+            # D<=192: 128x64  -> 64 KB (128x128 would use 96 KB, hurting occupancy)
+            # D=256:  64x64   -> 96 KB, fits only 1 KV stage (2 stages need 160 KB);
+            #         64x16 for underfilled pure-decode (ping-pong) comes via tile_n_256.
+            if head_dim <= 64:
+                cfg = FwdConfig(128, 128, True, True)
+            elif head_dim <= 192:
                 cfg = FwdConfig(128, 64, True, True)
+            else:  # head_dim 256: 64-wide is the only width that fits 99 KB SMEM
+                cfg = FwdConfig(64, tile_n_256 if tile_n_256 is not None else 64, True, True)
         elif arch // 10 == 8:
             cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:
@@ -999,6 +1006,24 @@ def _flash_attn_fwd(
         pack_gqa = True
     is_hdim256 = head_dim == 256 and head_dim_v == 256
     num_sms = get_num_sms_for_selection(device.index, arch)
+    # SM120 D=256: the base tile must be 64-wide (128x64 at D=256 uses 128 KB,
+    # over SM120's 99 KB SMEM, so can_implement rejects it). For underfilled
+    # pure-decode grids, 64x16 (48 KB) lets two CTAs per SM run in ping-pong so
+    # the second CTA's MMA hides the first's cp.async latency (bundle 9f7d3fa).
+    sm120_d256 = arch // 10 == 12 and is_hdim256 and tile_mn is None
+    tile_n_256 = None
+    sm120_d256_pingpong = False
+    if sm120_d256:
+        env_tile_n = os.environ.get("FA4_SM120_TILE_N_256")
+        if env_tile_n is not None:
+            tile_n_256 = int(env_tile_n)
+        else:
+            sm120_d256_pingpong = (
+                max_seqlen_q is not None
+                and max_seqlen_q <= 1
+                and total_q * num_head < 188  # grid cannot fill the SMs
+            )
+            tile_n_256 = 16 if sm120_d256_pingpong else 64
     # Caller-built varlen scheduler metadata assumes 1CTA tiles and the default pack_gqa.
     hd256_2cta_varlen_ok = cu_seqlens_q is None or scheduler_metadata is None
     if pack_gqa is None:
@@ -1032,6 +1057,7 @@ def _flash_attn_fwd(
         device=device,
         seqlen_q=seqlen_q,
         tile_mn=tile_mn,
+        tile_n_256=tile_n_256,
         block_sparse_tensors=block_sparse_tensors,
         mma_pv_is_rs=mma_pv_is_rs,
         intra_wg_overlap=intra_wg_overlap,
@@ -1797,9 +1823,22 @@ def _flash_attn_fwd(
                     assert seqused_k is not None, (
                         "Paged KV on SM120 requires seqused_k (actual sequence lengths per batch)"
                     )
-                # num_stages=2: pipeline K/V loads with MMA — for paged KV this also overlaps
-                # page table lookups with MMA, which hides the scatter-gather latency.
-                # SMEM budget at num_stages=2: D=128, tile_n=64 -> 96KB; D<=64, tile_n=128 -> 80KB.
+                # Overlap K/V loads with MMA when the SMEM budget allows:
+                # sQ + num_stages*(sK+sV) must fit SM120's 99 KB. D=128 128x64
+                # fits 2 stages (96 KB); D=256 64x64 only fits 1 stage (96 KB).
+                # Ping-pong decode (64x16) must stay at 1 KV stage (2 stages =
+                # 64 KB would evict the second CTA) -- bundle 9f7d3fa.
+                force_stages = int(os.environ.get("FA4_SM120_FORCE_STAGES", "0"))
+                if sm120_d256_pingpong:
+                    force_stages = force_stages or 1
+                num_stages_sm120 = force_stages if force_stages else (
+                    2
+                    if FlashAttentionForwardSm120.can_implement(
+                        dtype, head_dim, head_dim_v, tile_m, tile_n,
+                        2, num_threads, causal,
+                    )
+                    else 1
+                )
                 fa_fwd = FlashAttentionForwardSm120(
                     dtype,
                     head_dim,
