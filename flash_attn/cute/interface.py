@@ -1850,7 +1850,7 @@ def _flash_attn_fwd(
                     pack_gqa=pack_gqa,
                     tile_m=tile_m,
                     tile_n=tile_n,
-                    num_stages=2,
+                    num_stages=num_stages_sm120,
                     num_threads=num_threads,
                     Q_in_regs=False,
                     score_mod=score_mod,
@@ -1863,6 +1863,14 @@ def _flash_attn_fwd(
                 f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
             )
         # TODO: check @can_implement
+        # SM80/SM120 host signatures annotate the window args as Optional[Int32]
+        # (SM90/SM100 convert internally); convert Python ints here for those.
+        window_size_left_c = (
+            Int32(window_size_left) if window_size_left is not None else None
+        )
+        window_size_right_c = (
+            Int32(window_size_right) if window_size_right is not None else None
+        )
         if qv is not None:
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 fa_fwd,
@@ -1882,8 +1890,8 @@ def _flash_attn_fwd(
                 gather_kv_indices_tensor,
                 page_table_tensor,
                 descale_tensors_tensor,
-                window_size_left,
-                window_size_right,
+                window_size_left_c,
+                window_size_right_c,
                 learnable_sink=learnable_sink_tensor,
                 mOlo=o_lo_tensor,
                 stream=current_stream,
@@ -1903,8 +1911,8 @@ def _flash_attn_fwd(
                 seqused_q_tensor,
                 seqused_k_tensor,
                 page_table_tensor,
-                window_size_left,
-                window_size_right,
+                window_size_left_c,
+                window_size_right_c,
                 learnable_sink_tensor,
             ]
             if arch // 10 in [10, 11]:
@@ -1977,8 +1985,8 @@ def _flash_attn_fwd(
                 gather_kv_indices,
                 page_table,
                 descale_tensors,
-                window_size_left,
-                window_size_right,
+                window_size_left_c,
+                window_size_right_c,
                 learnable_sink,
                 o_lo,
             )
@@ -1995,8 +2003,8 @@ def _flash_attn_fwd(
                 seqused_q,
                 seqused_k,
                 page_table,
-                window_size_left,
-                window_size_right,
+                window_size_left_c,
+                window_size_right_c,
                 learnable_sink,
             ]
             if arch // 10 in [10, 11]:
