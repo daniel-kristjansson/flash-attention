@@ -701,18 +701,32 @@ class FlashAttentionForwardBase:
             paged_kv_manager.page_entry_per_thread,
         )
 
-        seqlenk_row_limit = (
-            seqlen - block * self.tile_n - tKcK_paged[0][0] if block >= 0 else 0
-        )
+        gtp = paged_kv_manager.gmem_threads_per_row
+        threads_per_row_wave = paged_kv_manager.num_threads // gtp
+        # The gmem copy's thread tile spans `threads_per_row_wave` rows per m
+        # unit.  When that exceeds the KV tile (SM120's 256-thread paged load
+        # covers 32 rows, while D=256 ping-pong decode uses tile_n=16), the
+        # out-of-tile rows must be skipped with a branch: a size-0 cp.async
+        # still writes its 16B zero-fill to the out-of-bounds smem destination
+        # (CUDA illegal address).  When the thread tile fits the KV tile, the
+        # original predicate-only path is used unchanged.
+        need_tile_guard = const_expr(threads_per_row_wave > self.tile_n)
+        if const_expr(need_tile_guard):
+            # Row this thread's gmem copy writes: one row per group of gtp
+            # consecutive threads (the pointer shuffle below broadcasts within
+            # the group), plus one full row wave per m unit.
+            own_row = paged_kv_manager.thread_idx // gtp
+            seqlen_limit = (
+                self.tile_n
+                if const_expr(not need_predicates)
+                else cutlass.min(seqlen - block * self.tile_n, self.tile_n)
+            )
+        else:
+            seqlenk_row_limit = (
+                seqlen - block * self.tile_n - tKcK_paged[0][0] if block >= 0 else 0
+            )
         stage = smem_pipe_write if const_expr(self.num_stages > 1) else 0
         for m in cutlass.range_constexpr(cute.size(tKsK_paged, mode=[1])):
-            row_valid = (
-                t0KcK_paged[0, m, 0][0] < seqlenk_row_limit
-                if const_expr(need_predicates) else True
-            )
-            should_load = cute.make_fragment_like(tKsK_paged[(0, None), m, 0, 0], cute.Boolean)
-            should_load.fill(row_valid)
-
             x_ptr_i64 = utils.shuffle_sync(
                 tPrKPtr[m // paged_kv_manager.gmem_threads_per_row],
                 m % paged_kv_manager.gmem_threads_per_row,
@@ -725,17 +739,49 @@ class FlashAttentionForwardBase:
             mX_cur = cute.make_tensor(x_gmem_ptr, cute.make_layout((paged_kv_manager.head_dim_padded,)))
             mX_cur_copy = cute.tiled_divide(mX_cur, (paged_kv_manager.async_copy_elems,))
 
-            for k in cutlass.range_constexpr(cute.size(tKsK_paged, mode=[2])):
-                ki = tKcK_paged[0, 0, k][1] // paged_kv_manager.async_copy_elems
-                mX_ki = mX_cur_copy[None, ki]
-                tKsK_k = tKsK_paged[None, m, k, stage]
-                mX_ki = cute.make_tensor(mX_ki.iterator, tKsK_k.layout)
-                cute.copy(
-                    paged_kv_manager.gmem_tiled_copy_KV,
-                    mX_ki,
-                    tKsK_k,
-                    pred=should_load,
+            if const_expr(need_tile_guard):
+                # The row branch may warp-diverge, so the width-gtp pointer
+                # shuffle above must stay outside it (all lanes must execute
+                # the same shuffle.sync).
+                row = own_row + m * threads_per_row_wave
+                row_valid = (
+                    row < seqlen - block * self.tile_n
+                    if const_expr(need_predicates) else True
                 )
+            else:
+                row = None
+                row_valid = (
+                    t0KcK_paged[0, m, 0][0] < seqlenk_row_limit
+                    if const_expr(need_predicates) else True
+                )
+            should_load = cute.make_fragment_like(tKsK_paged[(0, None), m, 0, 0], cute.Boolean)
+            should_load.fill(row_valid)
+
+            if const_expr(need_tile_guard):
+                if row < seqlen_limit:
+                    for k in cutlass.range_constexpr(cute.size(tKsK_paged, mode=[2])):
+                        ki = tKcK_paged[0, 0, k][1] // paged_kv_manager.async_copy_elems
+                        mX_ki = mX_cur_copy[None, ki]
+                        tKsK_k = tKsK_paged[None, m, k, stage]
+                        mX_ki = cute.make_tensor(mX_ki.iterator, tKsK_k.layout)
+                        cute.copy(
+                            paged_kv_manager.gmem_tiled_copy_KV,
+                            mX_ki,
+                            tKsK_k,
+                            pred=should_load,
+                        )
+            else:
+                for k in cutlass.range_constexpr(cute.size(tKsK_paged, mode=[2])):
+                    ki = tKcK_paged[0, 0, k][1] // paged_kv_manager.async_copy_elems
+                    mX_ki = mX_cur_copy[None, ki]
+                    tKsK_k = tKsK_paged[None, m, k, stage]
+                    mX_ki = cute.make_tensor(mX_ki.iterator, tKsK_k.layout)
+                    cute.copy(
+                        paged_kv_manager.gmem_tiled_copy_KV,
+                        mX_ki,
+                        tKsK_k,
+                        pred=should_load,
+                    )
 
     @cute.jit
     def paged_load_V(
@@ -771,18 +817,24 @@ class FlashAttentionForwardBase:
             paged_kv_manager.page_entry_per_thread,
         )
 
-        seqlenk_row_limit = (
-            seqlen - block * self.tile_n - tVcV_paged[0][0] if block >= 0 else 0
-        )
+        # Same row bound / tile guard as paged_load_K (see there for why the
+        # branch is required rather than a size-0 predicate).
+        gtp = paged_kv_manager.gmem_threads_per_row
+        threads_per_row_wave = paged_kv_manager.num_threads // gtp
+        need_tile_guard = const_expr(threads_per_row_wave > self.tile_n)
+        if const_expr(need_tile_guard):
+            own_row = paged_kv_manager.thread_idx // gtp
+            seqlen_limit = (
+                self.tile_n
+                if const_expr(not need_predicates)
+                else cutlass.min(seqlen - block * self.tile_n, self.tile_n)
+            )
+        else:
+            seqlenk_row_limit = (
+                seqlen - block * self.tile_n - tVcV_paged[0][0] if block >= 0 else 0
+            )
         stage = smem_pipe_write if const_expr(self.num_stages > 1) else 0
         for m in cutlass.range_constexpr(cute.size(tVsV_paged, mode=[1])):
-            row_valid = (
-                t0VcV_paged[0, m, 0][0] < seqlenk_row_limit
-                if const_expr(need_predicates) else True
-            )
-            should_load = cute.make_fragment_like(tVsV_paged[(0, None), m, 0, 0], cute.Boolean)
-            should_load.fill(row_valid)
-
             x_ptr_i64 = utils.shuffle_sync(
                 tPrVPtr[m // paged_kv_manager.gmem_threads_per_row],
                 m % paged_kv_manager.gmem_threads_per_row,
@@ -795,17 +847,46 @@ class FlashAttentionForwardBase:
             mX_cur = cute.make_tensor(x_gmem_ptr, cute.make_layout((paged_kv_manager.head_dim_v_padded,)))
             mX_cur_copy = cute.tiled_divide(mX_cur, (paged_kv_manager.async_copy_elems,))
 
-            for k in cutlass.range_constexpr(cute.size(tVsV_paged, mode=[2])):
-                ki = tVcV_paged[0, 0, k][1] // paged_kv_manager.async_copy_elems
-                mX_ki = mX_cur_copy[None, ki]
-                tVsV_k = tVsV_paged[None, m, k, stage]
-                mX_ki = cute.make_tensor(mX_ki.iterator, tVsV_k.layout)
-                cute.copy(
-                    paged_kv_manager.gmem_tiled_copy_KV,
-                    mX_ki,
-                    tVsV_k,
-                    pred=should_load,
+            if const_expr(need_tile_guard):
+                row = own_row + m * threads_per_row_wave
+                row_valid = (
+                    row < seqlen - block * self.tile_n
+                    if const_expr(need_predicates) else True
                 )
+            else:
+                row = None
+                row_valid = (
+                    t0VcV_paged[0, m, 0][0] < seqlenk_row_limit
+                    if const_expr(need_predicates) else True
+                )
+            should_load = cute.make_fragment_like(tVsV_paged[(0, None), m, 0, 0], cute.Boolean)
+            should_load.fill(row_valid)
+
+            if const_expr(need_tile_guard):
+                if row < seqlen_limit:
+                    for k in cutlass.range_constexpr(cute.size(tVsV_paged, mode=[2])):
+                        ki = tVcV_paged[0, 0, k][1] // paged_kv_manager.async_copy_elems
+                        mX_ki = mX_cur_copy[None, ki]
+                        tVsV_k = tVsV_paged[None, m, k, stage]
+                        mX_ki = cute.make_tensor(mX_ki.iterator, tVsV_k.layout)
+                        cute.copy(
+                            paged_kv_manager.gmem_tiled_copy_KV,
+                            mX_ki,
+                            tVsV_k,
+                            pred=should_load,
+                        )
+            else:
+                for k in cutlass.range_constexpr(cute.size(tVsV_paged, mode=[2])):
+                    ki = tVcV_paged[0, 0, k][1] // paged_kv_manager.async_copy_elems
+                    mX_ki = mX_cur_copy[None, ki]
+                    tVsV_k = tVsV_paged[None, m, k, stage]
+                    mX_ki = cute.make_tensor(mX_ki.iterator, tVsV_k.layout)
+                    cute.copy(
+                        paged_kv_manager.gmem_tiled_copy_KV,
+                        mX_ki,
+                        tVsV_k,
+                        pred=should_load,
+                    )
 
 
 class FlashAttentionForwardSm80(FlashAttentionForwardBase):
