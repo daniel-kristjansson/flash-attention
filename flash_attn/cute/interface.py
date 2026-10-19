@@ -1018,17 +1018,23 @@ def _flash_attn_fwd(
         if env_tile_n is not None:
             tile_n_256 = int(env_tile_n)
         else:
-            sm120_d256_pingpong = (
+            decode_underfilled = (
                 max_seqlen_q is not None
                 and max_seqlen_q <= 1
                 and total_q * num_head < 188  # grid cannot fill the SMs
-                # The 64x16 ping-pong tile OOBs against upstream/main's paged KV
-                # load for D=256 (illegal address); the HF-snapshot bundle's
-                # paged_kv.py did not exhibit it. Restrict to non-paged until the
-                # paged 64x16 load is root-caused (follow-up).
-                and page_table is None
             )
-            tile_n_256 = 16 if sm120_d256_pingpong else 64
+            if page_table is None and decode_underfilled:
+                sm120_d256_pingpong = True
+                tile_n_256 = 16
+            elif page_table is not None and decode_underfilled:
+                # Paged decode stays on 64x32.  The paged cp.async loads at
+                # 64x16 have a known non-deterministic per-head corruption race
+                # (follow-up); 64x32 is the validated clean tile.  (The
+                # out-of-bounds cp.async for paged tiles with tile_n < 32 rows
+                # is separately fixed in paged_load_K/V.)
+                tile_n_256 = 32
+            else:
+                tile_n_256 = 64
     # Caller-built varlen scheduler metadata assumes 1CTA tiles and the default pack_gqa.
     hd256_2cta_varlen_ok = cu_seqlens_q is None or scheduler_metadata is None
     if pack_gqa is None:
