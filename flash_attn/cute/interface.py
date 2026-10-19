@@ -1535,6 +1535,16 @@ def _flash_attn_fwd(
             hd256_mask_residual,
             hd256_use_2cta,
         )
+    # SM80/SM120 host signatures annotate the window args as Optional[Int32] (SM90/SM100
+    # convert internally); convert Python ints here for those. Defined outside the compile
+    # guard so the (cache-hit) call path sees it too.
+    window_size_left_c = (
+        Int32(window_size_left) if window_size_left is not None else None
+    )
+    window_size_right_c = (
+        Int32(window_size_right) if window_size_right is not None else None
+    )
+
     if compile_key not in _flash_attn_fwd.compile_cache:
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         (
@@ -1889,8 +1899,8 @@ def _flash_attn_fwd(
                 gather_kv_indices_tensor,
                 gather_kv_valid_length_tensor,
                 page_table_tensor,
-                window_size_left,
-                window_size_right,
+                window_size_left_c,
+                window_size_right_c,
                 current_stream,
                 options="--enable-tvm-ffi",
             )
@@ -1909,8 +1919,8 @@ def _flash_attn_fwd(
                 seqused_k_tensor,
                 dynamic_causal_tensor,
                 page_table_tensor,
-                window_size_left,
-                window_size_right,
+                window_size_left_c,
+                window_size_right_c,
                 learnable_sink_tensor,
             ]
             if arch // 10 in [10, 11]:
@@ -2008,8 +2018,8 @@ def _flash_attn_fwd(
                 gather_kv_indices,
                 gather_kv_valid_length,
                 page_table,
-                window_size_left,
-                window_size_right,
+                window_size_left_c,
+                window_size_right_c,
             )
         else:
             call_args = [
@@ -2025,8 +2035,8 @@ def _flash_attn_fwd(
                 seqused_k,
                 dynamic_causal,
                 page_table,
-                window_size_left,
-                window_size_right,
+                window_size_left_c,
+                window_size_right_c,
                 learnable_sink,
             ]
             if arch // 10 in [10, 11]:
