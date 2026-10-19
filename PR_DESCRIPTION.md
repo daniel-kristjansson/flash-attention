@@ -20,10 +20,10 @@ successor) as the substitution.** #2349 was skipped (superseded by #2599).
 ## Local SM120 deltas (from the `fa4_sm120` bundle)
 
 - **D=256** (own commit, trivially revertable): 64x64 base tile + 1-KV-stage
-  dispatch + `FA4_SM120_FORCE_STAGES`, 64x16 ping-pong decode (9f7d3fa),
-  paged decode on the 64x32 tile (see known issues). Required for
-  `head_dim=256` to dispatch on SM120's 99 KB SMEM (the previous
-  `head_dim>64 -> 128x64` needs 128 KB for D=256).
+  dispatch + `FA4_SM120_FORCE_STAGES`, 64x16 ping-pong decode (9f7d3fa, later
+  removed — see decode tile performance), paged decode on the 64x32 tile
+  (see known issues). Required for `head_dim=256` to dispatch on SM120's
+  99 KB SMEM (the previous `head_dim>64 -> 128x64` needs 128 KB for D=256).
 - **PDL** on the split-KV fwd->combine boundary (default on, `FA4_SM120_PDL`)
   + the `use_pdl=False` fix on the TMA kernel.
 - **Fix window_size Int32 conversion** for SM80/SM120 host signatures.
@@ -47,7 +47,10 @@ the bundle's own dropout tile reduction (superseded by #2657's philox dropout).
 - `compileall` clean on `flash_attn/cute` + tests/benchmarks.
 - D=128 dense causal + non-causal (TMA path): OK (max_err ~2e-3 / 8e-3).
 - D=256 dense causal + non-causal (64x64, 1 stage): OK.
-- D=256 dense decode (64x16 ping-pong): OK (max_err ~3e-4, 4096 nc / 2048 G4 c).
+- D=256 dense decode (64x64, the post-sweep default; 64x16 ping-pong was
+  removed — see decode tile performance): OK (max_err ~3.4e-4, B=1 and B=32
+  KLEN=4096 causal; B=1 30/30 clean stress, vs 26/30 corrupted at the old
+  64x16 default).
 - D=128 / D=192 paged decode (split-KV): OK (max_err ~3.5e-4).
 - D=256 paged prefill (QL=128, causal): OK (max_err ~4e-4).
 - D=256 paged decode (64x32): OK; the previously-crashing 64x16 configs
@@ -60,28 +63,54 @@ the bundle's own dropout tile reduction (superseded by #2657's philox dropout).
 
 ## Decode tile performance (SM120 D=256)
 
-Micro-benchmark, B=1, G=4 (NHQ=16), qlen=1 causal, bf16, KLEN in
-{2048, 4096, 8192}; median of 20 iters with cuda events, 3 warmup;
-dense via `flash_attn_func`, paged via varlen + page table.
-64x16 = the natural dense-decode dispatch (ping-pong); paged 64x16 is
-not measured (dispatch disabled pending the race in known issue 2).
+B-sweep, dense decode, D=256, qlen=1, causal, G=4 (NHQ=16), bf16, RTX PRO
+6000 (188 SMs, CC 12.0); median of 20 cuda-event iters, 3 warmup, via
+`flash_attn_func`. B=12/13 probe the old gate's boundary. CTA count = B*G
+(pack_gqa: one CTA per (batch, kv head)).
 
-| KLEN | dense 64x16pp | dense 64x32 | dense 64x64 | paged 64x32 | paged 64x64 |
-|------:|--------------:|------------:|------------:|------------:|------------:|
-| 2048 | 170 us | 158 us | 152 us | 188 us | 169 us |
-| 4096 | 292 us | 265 us | 256 us | 321 us | 285 us |
-| 8192 | 537 us | 485 us | 465 us | 587 us | 517 us |
+KLEN=4096 (us; % vs 64x32):
 
-Observations: with only 4 CTAs in flight (B=1, G=4), the larger KV tile
-is fastest and the 64x16 ping-pong tile is ~8-10% *slower* than 64x32
-(its design benefit — a second CTA per SM hiding the first's cp.async —
-needs CTA co-residency, which does not occur at this CTA count on a
-188-SM part). Paged carries a ~10-15% fixed page-table overhead over
-dense at the same tile. The dispatch therefore keeps 64x16 ping-pong
-for dense decode (bundle 9f7d3fa design) and 64x32 for paged decode
-(clean + close to 64x64), but a G>=4 B=1 workload would be fastest at
-64x64; revisiting the decode tile choice with higher-parallelism
-measurements is a candidate follow-up.
+| B | CTAs | 64x16pp (old default, B<=11) | 64x32 | 64x64 (new default) |
+|---:|-----:|-----------------------------:|------:|--------------------:
+| 1  | 4    | 299.6 (+13.1%)               | 264.8 | 256.6 (-3.1%) |
+| 2  | 8    | 291.8 (+11.6%)               | 261.4 | 253.8 (-2.9%) |
+| 4  | 16   | 288.1 (+10.2%)               | 261.5 | 252.8 (-3.3%) |
+| 8  | 32   | 311.8 (+14.0%)               | 273.5 | 270.8 (-1.0%) |
+| 12 | 48   | (gate off: 533.9)            | 549.4 | 531.7 (-3.2%) |
+| 13 | 52   | (gate off: 536.0)            | 548.0 | 532.7 (-2.8%) |
+| 16 | 64   | (gate off: 529.6)            | 551.2 | 532.1 (-3.5%) |
+| 32 | 128  | (gate off: 836.3)            | 868.4 | 834.6 (-3.9%) |
+
+KLEN=8192 (us; % vs 64x32):
+
+| B  | CTAs | 64x16pp | 64x32  | 64x64 (new default) |
+|---:|-----:|--------:|-------:|--------------------:
+| 4  | 16   | 556.1 (+14.4%)  | 486.0  | 465.9 (-4.1%) |
+| 16 | 64   | (gate off: 1020.7) | 1061.6 | 1033.5 (-2.6%) |
+| 32 | 128  | (gate off: 1608.5) | 1673.2 | 1604.6 (-4.1%) |
+
+(An earlier B=1 KLEN sweep gave the same picture: at KLEN=4096, 292/265/256
+us for 64x16pp/64x32/64x64.)
+
+Correctness: 64x32 and 64x64 clean at every (B, KLEN) (max_err <= 3.8e-4 vs
+fp32 SDPA at B in {2, 8, 32}). **64x16pp is intermittently wrong**: 26/30
+runs corrupted at B=1 KLEN=4096 with per-head output errors up to 0.11
+(same signature as the paged per-head race, known issue 2); also wrong at
+B=2 and B=8. The GPU was shared with another workload, which may widen race
+windows, but the tile loses on timing regardless.
+
+Decision: **the ping-pong decode path is removed** (this branch). Mechanism:
+64x16 (48 KB, 1 KV stage) only pays off if two CTAs co-reside per SM so one
+CTA's MMA hides the other's cp.async — i.e. the SMs must be CTA-starved, which
+requires more than 188 CTAs (B > 46 for G=4). The old gate
+(`total_q * num_head < 188`) compared *q-head slots* (Gx the CTA count under
+pack_gqa) to the SM count, so for G=4 it cut off at B=12 (48 CTAs) — the
+16x16 tile never ran in the regime where it could win, it only halved the KV
+tile (4x more loop iterations at KLEN=4096, forced 1 KV stage, no
+load/MMA overlap) and it is also the corrupted path. 64x64 (96 KB, 1 KV
+stage, the only D=256 width that fits the 99 KB SMEM) was the fastest or
+tied-fastest tile at every measured B and KLEN, so dense D=256 decode now
+always dispatches to 64x64. Paged decode is unchanged (64x32).
 
 ## Known issues
 
@@ -107,9 +136,16 @@ measurements is a candidate follow-up.
    so the trigger is the new out-of-tile row-skip branch); dense 64x16 with
    the same tiles is clean 9/9, localizing the race to the paged load path.
    PTX inspection shows ptxas hoisting the second m unit of the unrolled load
-   past the caller's commit/wait/barrier (benign at tile_n=16, noted). Until
-   root-caused, **paged D=256 decode dispatches to 64x32** (validated clean
-   15/15 above); dense D=256 decode keeps the 64x16 ping-pong tile.
+   past the caller's commit/wait/barrier (benign at tile_n=16, noted).
+   **Update:** the dense 64x16 path was removed from dispatch entirely (see
+   decode tile performance) — it too misfired, 26/30 runs corrupted at
+   B=1 KLEN=4096 — and dense D=256 decode now uses 64x64. Paged decode
+   still dispatches to 64x32, but under a loaded GPU the same per-head
+   corruption was also observed at paged 64x32 (4/20 runs, B=1 KLEN=2048;
+   identical before and after this branch's dispatch change; paged 64x64 was
+   0/20 clean in the same session), so the race's scope may be broader than
+   tile_n=16 or contention may widen the window — needs idle-GPU
+   re-validation; paged 64x64 is the candidate fallback.
 
 3. **B>1 multi-sequence paged decode: "corruption" — RESOLVED, not a kernel
    bug.** The original repro (`/tmp/paged_b4.py`) built its page table as

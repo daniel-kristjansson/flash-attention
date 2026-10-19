@@ -364,7 +364,7 @@ def _get_fwd_config(
             # D<=64:  128x128 -> 48 KB (good occupancy)
             # D<=192: 128x64  -> 64 KB (128x128 would use 96 KB, hurting occupancy)
             # D=256:  64x64   -> 96 KB, fits only 1 KV stage (2 stages need 160 KB);
-            #         64x16 for underfilled pure-decode (ping-pong) comes via tile_n_256.
+            #         64x32 for paged decode comes via tile_n_256.
             if head_dim <= 64:
                 cfg = FwdConfig(128, 128, True, True)
             elif head_dim <= 192:
@@ -1007,12 +1007,9 @@ def _flash_attn_fwd(
     is_hdim256 = head_dim == 256 and head_dim_v == 256
     num_sms = get_num_sms_for_selection(device.index, arch)
     # SM120 D=256: the base tile must be 64-wide (128x64 at D=256 uses 128 KB,
-    # over SM120's 99 KB SMEM, so can_implement rejects it). For underfilled
-    # pure-decode grids, 64x16 (48 KB) lets two CTAs per SM run in ping-pong so
-    # the second CTA's MMA hides the first's cp.async latency (bundle 9f7d3fa).
+    # over SM120's 99 KB SMEM, so can_implement rejects it).
     sm120_d256 = arch // 10 == 12 and is_hdim256 and tile_mn is None
     tile_n_256 = None
-    sm120_d256_pingpong = False
     if sm120_d256:
         env_tile_n = os.environ.get("FA4_SM120_TILE_N_256")
         if env_tile_n is not None:
@@ -1023,13 +1020,10 @@ def _flash_attn_fwd(
                 and max_seqlen_q <= 1
                 and total_q * num_head < 188  # grid cannot fill the SMs
             )
-            if page_table is None and decode_underfilled:
-                sm120_d256_pingpong = True
-                tile_n_256 = 16
-            elif page_table is not None and decode_underfilled:
-                # Paged decode stays on 64x32.  The paged cp.async loads at
-                # 64x16 have a known non-deterministic per-head corruption race
-                # (follow-up); 64x32 is the validated clean tile.  (The
+            if page_table is not None and decode_underfilled:
+                # Paged decode uses 64x32.  The paged cp.async loads at
+                # 64x16 have a known non-deterministic per-head corruption
+                # race (follow-up); 64x32 is the validated clean tile.  (The
                 # out-of-bounds cp.async for paged tiles with tile_n < 32 rows
                 # is separately fixed in paged_load_K/V.)
                 tile_n_256 = 32
@@ -1847,11 +1841,7 @@ def _flash_attn_fwd(
                 # Overlap K/V loads with MMA when the SMEM budget allows:
                 # sQ + num_stages*(sK+sV) must fit SM120's 99 KB. D=128 128x64
                 # fits 2 stages (96 KB); D=256 64x64 only fits 1 stage (96 KB).
-                # Ping-pong decode (64x16) must stay at 1 KV stage (2 stages =
-                # 64 KB would evict the second CTA) -- bundle 9f7d3fa.
                 force_stages = int(os.environ.get("FA4_SM120_FORCE_STAGES", "0"))
-                if sm120_d256_pingpong:
-                    force_stages = force_stages or 1
                 num_stages_sm120 = force_stages if force_stages else (
                     2
                     if FlashAttentionForwardSm120.can_implement(

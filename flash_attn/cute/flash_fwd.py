@@ -722,7 +722,7 @@ class FlashAttentionForwardBase:
         threads_per_row_wave = paged_kv_manager.num_threads // gtp
         # The gmem copy's thread tile spans `threads_per_row_wave` rows per m
         # unit.  When that exceeds the KV tile (SM120's 256-thread paged load
-        # covers 32 rows, while D=256 ping-pong decode uses tile_n=16), the
+        # covers 32 rows, while D=256 64x16 paged loads use tile_n=16), the
         # out-of-tile rows must be skipped with a branch: a size-0 cp.async
         # still writes its 16B zero-fill to the out-of-bounds smem destination
         # (CUDA illegal address).  When the thread tile fits the KV tile, the
