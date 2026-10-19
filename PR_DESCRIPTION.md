@@ -21,8 +21,9 @@ successor) as the substitution.** #2349 was skipped (superseded by #2599).
 
 - **D=256** (own commit, trivially revertable): 64x64 base tile + 1-KV-stage
   dispatch + `FA4_SM120_FORCE_STAGES`, 64x16 ping-pong decode (9f7d3fa, later
-  removed — see decode tile performance), paged decode on the 64x32 tile
-  (see known issues). Required for `head_dim=256` to dispatch on SM120's
+  removed — see decode tile performance), paged decode on 64x64 (the 64x32
+  and 64x16 KV tiles are corrupted — see known issue 2). Required for
+  `head_dim=256` to dispatch on SM120's
   99 KB SMEM (the previous `head_dim>64 -> 128x64` needs 128 KB for D=256).
 - **PDL** on the split-KV fwd->combine boundary (default on, `FA4_SM120_PDL`)
   + the `use_pdl=False` fix on the TMA kernel.
@@ -53,13 +54,58 @@ the bundle's own dropout tile reduction (superseded by #2657's philox dropout).
   64x16 default).
 - D=128 / D=192 paged decode (split-KV): OK (max_err ~3.5e-4).
 - D=256 paged prefill (QL=128, causal): OK (max_err ~4e-4).
-- D=256 paged decode (64x32): OK; the previously-crashing 64x16 configs
-  (512 G=1 causal, 2048 G=2 causal, 4096 G=2 non-causal) run clean 15/15
-  via the 64x32 dispatch (max_err ~3e-4..7e-4); `compute-sanitizer --tool
-  memcheck` clean on the guarded loads.
+- D=256 paged decode (64x64): OK — idle-GPU stress, 420 runs over 7
+  configs, 0 bad (see known issue 2 for the table and for the 64x32 tile
+  this replaces); max_err <= 3.6e-3 vs fp32 SDPA (bf16 quantization).
+  `compute-sanitizer --tool memcheck` clean on the guarded paged loads.
+- D=256 paged decode with split-KV (num_splits 2 and 4, KLEN 2048/4096/8192):
+  OK (max_err <= 3.6e-4).
 - Multi-sequence varlen paged decode (B=2 mixed klen, B=3 mixed qlen, B=8
   mixed klen, G=1/2): OK (max_err ~1.4e-3). See known issue 3 — the earlier
   "B=4 corruption" was the repro's page table, not the kernel.
+
+## Production readiness (SM120)
+
+Kernel-level (FA4 API on an RTX PRO 6000, SM 12.0, bf16 in / fp32 out,
+compared against fp32 SDPA; tolerance ~1e-2 per-head absolute, clean runs
+land at 3e-4..3.6e-3). The paged D=256 decode rows were (re)measured with the
+stress harness on an idle GPU; the rest are this branch's validation record.
+
+**Validated**
+
+- Dense D=128 causal + non-causal (TMA path): max_err ~2e-3 / 8e-3.
+- Dense D=256 forward: prefill and decode (64x64, 1 KV stage), causal and
+  non-causal, GQA; decode stress 30/30 clean at B=1 and B=32 KLEN=4096,
+  against 26/30 corrupted at the removed 64x16 tile.
+- Paged D=256 prefill (QL=128, causal): max_err ~4e-4.
+- Paged D=256 decode, 64x64, non-split: 7-config stress matrix, 420 runs on
+  an idle GPU, **0 bad** — B=1/4/8, KLEN 128..8192, mixed klen, mixed qlen,
+  G=1/2/4, causal and non-causal, page_size 16, per-batch page tables.
+  Re-run through the shipped default dispatch: 0/210.
+- Paged D=256 decode with split-KV (`num_splits` 2 and 4; KLEN 2048/4096/
+  8192): 0/48, max_err <= 3.6e-4.
+- Paged D=128 / D=192 decode (split-KV): max_err ~3.5e-4.
+- `compute-sanitizer --tool memcheck` clean on the guarded paged loads.
+- Regression tests: `tests/cute/test_flash_attn_paged_decode_sm120.py`,
+  `tests/cute/test_repeated_call_sm120.py`, `tests/cute/test_splitkv_sm120.py`.
+
+**Not validated**
+
+- FP8 KV cache / fp8 inputs (`float8_e4m3fn`), and descale paths, on any SM120
+  shape.
+- `page_size != 16`: that takes the `paged_kv_non_tma` loader, which the
+  stress matrix did not exercise.
+- B > 8 or KLEN > 8192 for paged D=256 decode; `num_splits` other than
+  explicit 2/4 (the `num_splits < 1` heuristic is not stress-tested).
+- Non-default `tile_mn`, local/windowed attention, softcap, `score_mod`,
+  `mask_mod`, block sparsity, dropout, and the backward pass on D=256 paged
+  paths (the SM120 deltas here are forward-only additions).
+- CUDA graph capture, `torch.compile`, and PDL under stress (PDL is on by
+  default; the stress matrix above ran with it).
+- Anything on SM80/SM90/SM100/SM110: this branch's changes are gated to
+  `arch // 10 == 12` and those paths were not re-run here.
+- End-to-end vLLM: the numbers above are kernel-level FA4 API calls, not
+  vLLM integration tests.
 
 ## Decode tile performance (SM120 D=256)
 
@@ -110,7 +156,11 @@ tile (4x more loop iterations at KLEN=4096, forced 1 KV stage, no
 load/MMA overlap) and it is also the corrupted path. 64x64 (96 KB, 1 KV
 stage, the only D=256 width that fits the 99 KB SMEM) was the fastest or
 tied-fastest tile at every measured B and KLEN, so dense D=256 decode now
-always dispatches to 64x64. Paged decode is unchanged (64x32).
+always dispatches to 64x64. Paged decode now uses the same 64x64 tile: the
+paged 64x32 tile is corrupted (known issue 2) and 64x64 is also 10-13%
+faster on paged decode (B=1 KLEN=2048: 165.6 vs 183.2 us; B=1 KLEN=4096:
+279.5 vs 312.0 us; B=4 KLEN=4096: 275.7 vs 315.5 us; B=8 mixed klen: 516.3
+vs 584.2 us; median of 20).
 
 ## Known issues
 
@@ -128,24 +178,54 @@ always dispatches to 64x64. Paged decode is unchanged (64x32).
    original path unchanged. The pre-fix stopgap (64x16 restricted to non-paged)
    is superseded by the dispatch below.
 
-2. **Paged 64x16: non-deterministic per-head corruption (OPEN, follow-up).**
-   With the OOB fixed, paged KV at tile_n=16 corrupts one (or adjacent
-   pairs of) heads in ~30% of runs: e.g. KLEN=512 G=1 causal flaked 2/5
-   (bad head err 0.2–0.33 vs ~3e-4 clean heads); also seen at KLEN=2048/4096
-   G=2. Every flaky config has KLEN % 16 == 0 (seqlen predicates are no-ops,
-   so the trigger is the new out-of-tile row-skip branch); dense 64x16 with
-   the same tiles is clean 9/9, localizing the race to the paged load path.
-   PTX inspection shows ptxas hoisting the second m unit of the unrolled load
-   past the caller's commit/wait/barrier (benign at tile_n=16, noted).
-   **Update:** the dense 64x16 path was removed from dispatch entirely (see
-   decode tile performance) — it too misfired, 26/30 runs corrupted at
-   B=1 KLEN=4096 — and dense D=256 decode now uses 64x64. Paged decode
-   still dispatches to 64x32, but under a loaded GPU the same per-head
-   corruption was also observed at paged 64x32 (4/20 runs, B=1 KLEN=2048;
-   identical before and after this branch's dispatch change; paged 64x64 was
-   0/20 clean in the same session), so the race's scope may be broader than
-   tile_n=16 or contention may widen the window — needs idle-GPU
-   re-validation; paged 64x64 is the candidate fallback.
+2. **Paged decode at narrow KV tiles: non-deterministic per-head corruption
+   — WORKED AROUND, dispatch now avoids it (root cause OPEN).**
+   The paged cp.async KV load corrupts whole heads at narrow KV tiles. It
+   first showed at tile_n=16 (~2/5 runs, err 0.2–0.33 vs ~3e-4 clean heads),
+   then at tile_n=32 under GPU contention (4/20 runs, B=1 KLEN=2048). An
+   idle-GPU stress matrix (RTX PRO 6000, D=256, NHK=4, page_size 16, bf16,
+   fresh random data every run, fp32 SDPA reference, 188-SM device otherwise
+   idle) settles it: **64x32 is broken at idle too, far worse than the
+   contention-time rate suggested**. Runs bad (>1e-2 per-head err; clean runs
+   are <= 3.6e-3) out of 30, two independent seed sets where repeated:
+
+   | config (G=4 unless stated) | 64x32 | 64x64 |
+   |---|---:|---:|
+   | B=1 KLEN=2048 causal | 6/30, 7/30 | 0/30, 0/30 |
+   | B=1 KLEN=4096 causal | 9/30 | 0/30, 0/30 |
+   | B=4 KLEN=4096 causal | 23/30, 21/30 | 0/30, 0/30 |
+   | B=8 mixed klen 128..8192 causal | 27/30 | 0/30, 0/30 |
+   | B=1 KLEN=2048 causal, G=1 | 0/30 | 0/30, 0/30 |
+   | B=4 KLEN=4096 non-causal | 30/30, 30/30 | 0/30, 0/30 |
+   | B=3 mixed qlen [1,2,1] non-causal | 30/30 | 0/30, 0/30 |
+   | **total** | **183/300** (125/210 + 58/90) | **0/420** |
+
+   Bad runs lose one to several whole heads (err 0.076–0.72, e.g. B=8 mixed
+   klen: heads 1, 7, 8 at 0.098/0.384/0.721 while the rest are ~2e-3); the
+   affected heads differ run to run.
+
+   Localization: the same B=4 KLEN=4096 shape through the **dense** kernel at
+   tile 64x32 is 0/10 clean while paged is 10/10 bad, so the defect is in the
+   paged load, not the tile math. It is not the number of KV stages
+   (`FA4_SM120_FORCE_STAGES=1` at 64x32 is still 10/10 bad), not a GQA
+   head-mapping swap (the `i % NHK` mapping explains none of the bad heads),
+   and not present in split-KV (`num_splits` 2/4 paged decode is clean at
+   both tiles, 0/48 each) — the trigger is the non-split paged decode loop
+   with a narrow KV tile. PTX inspection earlier showed ptxas hoisting the
+   second m unit of the unrolled load past the caller's commit/wait/barrier.
+
+   **Outcome:** paged D=256 decode dispatches to 64x64, which is clean over
+   the whole matrix (0/420, and 0/210 again with the shipped default) and is
+   10-13% faster than 64x32, so the safe tile costs nothing. Pinned by
+   `tests/cute/test_flash_attn_paged_decode_sm120.py` (fails 3/3 when the
+   tile is forced back to 64x32, passes 3/3 on the default).
+
+   **Residual risk:** the root cause is unfixed — the narrow-tile paged load
+   path is simply not used any more for D=256. Anything that reintroduces a
+   KV tile below 64 rows on a paged path (a future tile, page-size-specific
+   loader, or `FA4_SM120_TILE_N_256=32/16`) re-exposes it. The matrix covers
+   page_size 16 only, G=1/2/4, B<=8, KLEN<=8192; other page sizes take the
+   `paged_kv_non_tma` loader, which this sweep did not exercise.
 
 3. **B>1 multi-sequence paged decode: "corruption" — RESOLVED, not a kernel
    bug.** The original repro (`/tmp/paged_b4.py`) built its page table as

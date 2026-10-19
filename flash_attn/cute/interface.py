@@ -363,8 +363,8 @@ def _get_fwd_config(
             # SM120 tile sizes tuned for 99 KB SMEM capacity:
             # D<=64:  128x128 -> 48 KB (good occupancy)
             # D<=192: 128x64  -> 64 KB (128x128 would use 96 KB, hurting occupancy)
-            # D=256:  64x64   -> 96 KB, fits only 1 KV stage (2 stages need 160 KB);
-            #         64x32 for paged decode comes via tile_n_256.
+            # D=256:  64x64   -> 96 KB, fits only 1 KV stage (2 stages need 160 KB).
+            #         A decode-specific width can be forced via tile_n_256.
             if head_dim <= 64:
                 cfg = FwdConfig(128, 128, True, True)
             elif head_dim <= 192:
@@ -1015,20 +1015,15 @@ def _flash_attn_fwd(
         if env_tile_n is not None:
             tile_n_256 = int(env_tile_n)
         else:
-            decode_underfilled = (
-                max_seqlen_q is not None
-                and max_seqlen_q <= 1
-                and total_q * num_head < 188  # grid cannot fill the SMs
-            )
-            if page_table is not None and decode_underfilled:
-                # Paged decode uses 64x32.  The paged cp.async loads at
-                # 64x16 have a known non-deterministic per-head corruption
-                # race (follow-up); 64x32 is the validated clean tile.  (The
-                # out-of-bounds cp.async for paged tiles with tile_n < 32 rows
-                # is separately fixed in paged_load_K/V.)
-                tile_n_256 = 32
-            else:
-                tile_n_256 = 64
+            # Decode (dense and paged) uses 64x64.  Narrower KV tiles are
+            # corrupted by the paged cp.async load: 64x32 loses whole heads
+            # non-deterministically (max_err 0.08-0.72 vs 3e-4 clean) on an
+            # idle GPU -- 6/30 and 7/30 bad runs at B=1 KLEN=2048 G=4 causal,
+            # 23/30 and 21/30 at B=4 KLEN=4096, 30/30 non-causal, 27/30 at
+            # B=8 mixed klen -- while the same shapes are clean dense and
+            # 64x64 is 0/420 over that stress matrix (and 10-13% faster).
+            # See the PR description's known issue 2.
+            tile_n_256 = 64
     # Caller-built varlen scheduler metadata assumes 1CTA tiles and the default pack_gqa.
     hd256_2cta_varlen_ok = cu_seqlens_q is None or scheduler_metadata is None
     if pack_gqa is None:
