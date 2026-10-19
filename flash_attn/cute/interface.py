@@ -478,8 +478,10 @@ def _get_fwd_config(
     # hd=256 forward uses the dedicated Blackwell-family kernel, which has no
     # SplitKV variant.
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
-    if arch // 10 == 12:
-        assert num_splits == 1, "SM120 forward only supports num_splits=1"
+    if arch // 10 == 8:
+        # SM80 shares the SM80-style forward kernel with SM120 but has no SplitKV path
+        # wired here (no TMA O store); keep a single split.
+        num_splits = 1
     elif use_dedicated_hd256_kernel:
         num_splits = 1
     elif num_splits < 1:
@@ -1048,6 +1050,11 @@ def _flash_attn_fwd(
         num_splits = decode_splits[1]
 
     is_split_kv = num_splits > 1
+    if arch // 10 == 12 and is_split_kv and pack_gqa:
+        # pack_gqa is an auto-selected optimization; the packed O/LSE layout is not
+        # wired through the FP32-partial epilogue, so fall back to unpacked GQA when
+        # splitting (correctness over the packing speedup).
+        pack_gqa = False
     if is_split_kv:
         # flash_fwd_combine wants the query dim contiguous in the partial LSE; qv has it first
         lse_partial_shape = (
@@ -1065,8 +1072,11 @@ def _flash_attn_fwd(
                 assumed_align=4,
             )
         else:
-            out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
-            lse_partial = torch.empty(lse_partial_shape, dtype=torch.float32, device=device)
+            # Splits whose K range is empty (e.g. causal limits n_block_max while
+            # num_splits is derived from the full K length) skip their epilogue store,
+            # so the partials must start at the combine identity: O = 0, LSE = -inf.
+            out_partial = torch.zeros(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
+            lse_partial = torch.full(lse_partial_shape, float("-inf"), dtype=torch.float32, device=device)
 
     use_2cta_instrs = (
         arch // 10 in [10, 11]
@@ -1743,8 +1753,7 @@ def _flash_attn_fwd(
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
-            assert page_table is None, "Paged KV not supported on SM 12.0 in this PR"
-            assert not is_split_kv, "SplitKV not supported on SM 12.0 in this PR"
+            assert page_table is None, "Paged KV not supported on SM 12.0"
             fa_fwd = FlashAttentionForwardSm120(
                 dtype,
                 head_dim,
@@ -1752,6 +1761,7 @@ def _flash_attn_fwd(
                 qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
+                is_split_kv=is_split_kv,
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
