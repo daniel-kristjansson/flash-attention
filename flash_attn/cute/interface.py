@@ -1755,14 +1755,18 @@ def _flash_attn_fwd(
                         seqlen_k_per_split=seqlen_k_per_split,
                     )
         elif arch // 10 == 12:
-            # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
-            assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
-            # TMA kernel when: no paged KV, no varlen, no split-KV.
-            # The TMA kernel does not implement split-KV (its O store uses a fixed 4D
-            # layout), so split-KV and paged-KV requests fall through to the SM80-base
-            # SM120 kernel, which handles both.
+            # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity.
+            # The non-TMA SM80-base SM120 kernel handles split-KV (FP32 partials), paged KV and
+            # block-sparse; the TMA kernel handles only dense, non-paged, non-varlen, non-split-KV,
+            # non-block-sparse requests (fixed 4D O store, no block-sparse mainloop), so those
+            # cases fall through to the non-TMA kernel.
             is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None
-            use_tma_sm120 = page_table is None and not is_varlen and not is_split_kv
+            use_tma_sm120 = (
+                page_table is None
+                and not is_varlen
+                and not is_split_kv
+                and not use_block_sparsity
+            )
             if use_tma_sm120 and FlashAttentionForwardSm120Tma.can_implement(
                 dtype, head_dim, head_dim_v, tile_m, tile_n,
                 num_mma_warps=8, kv_stages=2, is_causal=causal,
