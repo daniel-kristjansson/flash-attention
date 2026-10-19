@@ -419,6 +419,7 @@ def _get_fwd_config(
     device,
     seqlen_q: Optional[int] = None,
     tile_mn: Optional[Tuple[int, int]] = None,
+    tile_n_256: Optional[int] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     mma_pv_is_rs: Optional[bool] = None,
     intra_wg_overlap: Optional[bool] = None,
@@ -431,10 +432,16 @@ def _get_fwd_config(
     if tile_mn is None:
         if arch // 10 == 12:
             # SM120 tile sizes tuned for 99 KB SMEM capacity:
-            # D<=64:  128x128 → 48 KB (good occupancy)
-            # D>64:   128x64  → 64 KB (128x128 would use 96 KB, hurting occupancy)
-            if head_dim > 64:
+            # D<=64:  128x128 -> 48 KB (good occupancy)
+            # D<=192: 128x64  -> 64 KB (128x128 would use 96 KB, hurting occupancy)
+            # D=256:  64x64   -> 96 KB, fits only 1 KV stage (2 stages need 160 KB).
+            #         A decode-specific width can be forced via tile_n_256.
+            if head_dim <= 64:
+                cfg = FwdConfig(128, 128, True, True)
+            elif head_dim <= 192:
                 cfg = FwdConfig(128, 64, True, True)
+            else:  # head_dim 256: 64-wide is the only width that fits 99 KB SMEM
+                cfg = FwdConfig(64, tile_n_256 if tile_n_256 is not None else 64, True, True)
         elif arch // 10 == 8:
             cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:
@@ -977,6 +984,21 @@ def _flash_attn_fwd(
     if cu_seqlens_k is None and seqused_k is None:
         min_seqlen_k = seqlen_k
 
+    is_hdim256 = head_dim == 256 and head_dim_v == 256
+    # SM120 D=256: the base tile must be 64-wide (128x64 at D=256 uses 128 KB, over SM120's
+    # 99 KB SMEM, so can_implement rejects it).
+    sm120_d256 = arch // 10 == 12 and is_hdim256 and tile_mn is None
+    tile_n_256 = None
+    if sm120_d256:
+        env_tile_n = os.environ.get("FA4_SM120_TILE_N_256")
+        if env_tile_n is not None:
+            tile_n_256 = int(env_tile_n)
+        else:
+            # Decode (dense and paged) uses 64x64. Narrower KV tiles are corrupted by the
+            # paged cp.async load: 64x32 loses whole heads non-deterministically
+            # (max_err 0.08-0.72 vs 3e-4 clean) on an idle GPU, while 64x64 is clean over
+            # the whole stress matrix and 10-13% faster.
+            tile_n_256 = 64
     fwd_cfg = _get_fwd_config(
         arch=arch,
         head_dim=head_dim,
@@ -995,6 +1017,7 @@ def _flash_attn_fwd(
         device=device,
         seqlen_q=seqlen_q,
         tile_mn=tile_mn,
+        tile_n_256=tile_n_256,
         block_sparse_tensors=block_sparse_tensors,
         mma_pv_is_rs=mma_pv_is_rs,
         intra_wg_overlap=intra_wg_overlap,
