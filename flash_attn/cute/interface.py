@@ -1022,6 +1022,11 @@ def _flash_attn_fwd(
                 max_seqlen_q is not None
                 and max_seqlen_q <= 1
                 and total_q * num_head < 188  # grid cannot fill the SMs
+                # The 64x16 ping-pong tile OOBs against upstream/main's paged KV
+                # load for D=256 (illegal address); the HF-snapshot bundle's
+                # paged_kv.py did not exhibit it. Restrict to non-paged until the
+                # paged 64x16 load is root-caused (follow-up).
+                and page_table is None
             )
             tile_n_256 = 16 if sm120_d256_pingpong else 64
     # Caller-built varlen scheduler metadata assumes 1CTA tiles and the default pack_gqa.
