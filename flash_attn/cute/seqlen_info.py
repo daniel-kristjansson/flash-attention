@@ -94,8 +94,42 @@ class SeqlenInfoQK:
         tile_m: cutlass.Constexpr[Int32] = 128,
         tile_n: cutlass.Constexpr[Int32] = 128,
     ):
-        offset_q = 0 if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx]
-        offset_k = 0 if const_expr(mCuSeqlensK is None) else mCuSeqlensK[batch_idx]
+        # Varlen grid tiles are padded to a per-batch max, so batch_idx can equal
+        # num_batch (a wasted tile). Clamp the read indices so the seqused and
+        # cu_seqlens[batch_idx + 1] reads stay in bounds; clamped reads yield
+        # seqlen 0 for wasted tiles (seqused: last value reused, cu: x - x).
+        cuq_idx = (
+            batch_idx
+            if const_expr(mCuSeqlensQ is None)
+            else cute.min(batch_idx, mCuSeqlensQ.shape[0] - 1)
+        )
+        cuq_next_idx = (
+            batch_idx + 1
+            if const_expr(mCuSeqlensQ is None)
+            else cute.min(batch_idx + 1, mCuSeqlensQ.shape[0] - 1)
+        )
+        cuk_idx = (
+            batch_idx
+            if const_expr(mCuSeqlensK is None)
+            else cute.min(batch_idx, mCuSeqlensK.shape[0] - 1)
+        )
+        cuk_next_idx = (
+            batch_idx + 1
+            if const_expr(mCuSeqlensK is None)
+            else cute.min(batch_idx + 1, mCuSeqlensK.shape[0] - 1)
+        )
+        suq_idx = (
+            batch_idx
+            if const_expr(mSeqUsedQ is None)
+            else cute.min(batch_idx, mSeqUsedQ.shape[0] - 1)
+        )
+        suk_idx = (
+            batch_idx
+            if const_expr(mSeqUsedK is None)
+            else cute.min(batch_idx, mSeqUsedK.shape[0] - 1)
+        )
+        offset_q = 0 if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[cuq_idx]
+        offset_k = 0 if const_expr(mCuSeqlensK is None) else mCuSeqlensK[cuk_idx]
         padded_offset_q = (
             0
             if const_expr(mCuSeqlensQ is None)
@@ -107,20 +141,24 @@ class SeqlenInfoQK:
             else cute.assume((offset_k + batch_idx * tile_n) // tile_n * tile_n, divby=tile_n)
         )
         if const_expr(mSeqUsedQ is not None):
-            seqlen_q = mSeqUsedQ[batch_idx]
+            # Wasted tile (batch_idx == num_batch): seqused read is clamped above,
+            # force seqlen 0 so no K/V work is scheduled for it.
+            in_range_q = Int32(batch_idx < mSeqUsedQ.shape[0])
+            seqlen_q = mSeqUsedQ[suq_idx] * in_range_q
         else:
             seqlen_q = (
                 seqlen_q_static
                 if const_expr(mCuSeqlensQ is None)
-                else mCuSeqlensQ[batch_idx + 1] - offset_q
+                else mCuSeqlensQ[cuq_next_idx] - offset_q
             )
         if const_expr(mSeqUsedK is not None):
-            seqlen_k = mSeqUsedK[batch_idx]
+            in_range_k = Int32(batch_idx < mSeqUsedK.shape[0])
+            seqlen_k = mSeqUsedK[suk_idx] * in_range_k
         else:
             seqlen_k = (
                 seqlen_k_static
                 if const_expr(mCuSeqlensK is None)
-                else mCuSeqlensK[batch_idx + 1] - offset_k
+                else mCuSeqlensK[cuk_next_idx] - offset_k
             )
         m_block_offset = 0 if const_expr(mCuTotalMBlocks is None) else mCuTotalMBlocks[batch_idx]
         num_n_blocks = (seqlen_k + tile_n - 1) // tile_n
