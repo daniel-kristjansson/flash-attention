@@ -146,6 +146,10 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         self.num_mma_warps = num_mma_warps
         self.kv_stages = kv_stages
         self.use_tma_O = False  # SM120 doesn't have WGMMA, so O store uses SMEM not TMA
+        # The inherited epilogue (flash_fwd.py) reads self.use_pdl; the TMA
+        # launch does not wire PDL (no split-KV combine boundary), so keep it
+        # off here rather than inheriting the non-TMA kernel's env default.
+        self.use_pdl = False
 
     @staticmethod
     def can_implement(

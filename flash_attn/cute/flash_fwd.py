@@ -499,6 +499,16 @@ class FlashAttentionForwardBase:
                 else:
                     pack_gqa.store_O(mO_cur, tOrO, gmem_tiled_copy_O, tidx, m_block, seqlen.seqlen_q)
 
+        # PDL: after every epilogue store is issued, let the dependent combine
+        # kernel start dispatching (it gates its loads on griddepcontrol.wait).
+        if const_expr(self.use_pdl and self.is_split_kv):
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierFwd.Epilogue),
+                number_of_threads=self.num_epilogue_threads,
+            )
+            if tidx == 0:
+                cute.arch.griddepcontrol_launch_dependents()
+
     @cute.jit
     def advance_pipeline(self, pipeline_index):
         return pipeline_index + 1 if pipeline_index < self.num_stages - 1 else 0
@@ -982,6 +992,10 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         )
         # Capture o_dtype from the output tensor (FP32 for split-KV, else same as Q/K/V)
         self.o_dtype = mO.element_type
+        # PDL: let the split-KV combine kernel's launch/prologue overlap this
+        # kernel's drain (combine already calls griddepcontrol.wait).
+        import os as _os
+        self.use_pdl = _os.environ.get("FA4_SM120_PDL", "1") == "1"
         tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
         self.num_mma_threads = tiled_mma_pv.size
         self.num_producer_threads = self.num_threads
@@ -1094,6 +1108,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             block=[self.num_threads, 1, 1],
             smem=SharedStorage.size_in_bytes(),
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
