@@ -137,7 +137,12 @@ if (FA2_ENABLED)
 
     # For CUDA we set the architectures on a per file basis
     if (VLLM_GPU_LANG STREQUAL "CUDA")
-        cuda_archs_loose_intersection(FA2_ARCHS "8.0+PTX" "${CUDA_ARCHS}")
+        # 12.0 (SM120) must be listed explicitly: without it FA2 only emits an
+        # sm_80 cubin plus sm_80 PTX, and drivers paired with newer nvcc reject
+        # that PTX at runtime ("the provided PTX was compiled with an unsupported
+        # toolchain", cudaErrorUnsupportedPtxVersion), so FA2 cannot run on
+        # SM120 at all.
+        cuda_archs_loose_intersection(FA2_ARCHS "8.0+PTX;12.0" "${CUDA_ARCHS}")
         message(STATUS "FA2_ARCHS: ${FA2_ARCHS}")
 
         set_gencode_flags_for_srcs(
